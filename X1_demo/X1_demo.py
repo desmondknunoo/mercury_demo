@@ -10,7 +10,7 @@ Tool_LEN = 175
 Camera_LEN = 78
 np.set_printoptions(suppress=True, formatter={'float_kind': '{:.2f}'.format})
 # 相机配置文件
-camera_params = np.load("src/camera_params.npz")
+camera_params = np.load("camera_params.npz")
 mtx, dist = camera_params["mtx"], camera_params["dist"]
 # 二维码大小
 MARKER_SIZE = 32
@@ -109,7 +109,7 @@ def calc_markers_base_position(corners: NDArray, ids: T.List, marker_size: int, 
 
 if __name__ == "__main__":
     # 设置摄像头id
-    camera = UVCCamera(5, mtx, dist)
+    camera = UVCCamera("/dev/left_camera", mtx, dist)
     # 打开摄像头
     camera.capture()
     # 设置左臂观察点
