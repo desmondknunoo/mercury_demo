@@ -1,0 +1,491 @@
+import json
+import threading
+
+from uvc_camera import UVCCamera
+import cv2
+import time
+import numpy as np
+from transformation import *
+from pymycobot import Mercury
+import typing as T
+import cv2.aruco as aruco
+from marker_utils import *
+import stag
+from matplotlib.path import Path
+
+
+# Convert the rotation matrix to Euler angles
+def CvtRotationMatrixToEulerAngle(pdtRotationMatrix):
+    pdtEulerAngle = np.zeros(3)
+    pdtEulerAngle[2] = np.arctan2(pdtRotationMatrix[1, 0], pdtRotationMatrix[0, 0])
+    fCosRoll = np.cos(pdtEulerAngle[2])
+    fSinRoll = np.sin(pdtEulerAngle[2])
+    pdtEulerAngle[1] = np.arctan2(-pdtRotationMatrix[2, 0],
+                                  (fCosRoll * pdtRotationMatrix[0, 0]) + (fSinRoll * pdtRotationMatrix[1, 0]))
+    pdtEulerAngle[0] = np.arctan2((fSinRoll * pdtRotationMatrix[0, 2]) - (fCosRoll * pdtRotationMatrix[1, 2]),
+                                  (-fSinRoll * pdtRotationMatrix[0, 1]) + (fCosRoll * pdtRotationMatrix[1, 1]))
+    return pdtEulerAngle
+
+
+# Obtain object coordinates (camera system)
+def calc_markers_base_position(corners: NDArray, ids: T.List, marker_size: int, mtx: NDArray, dist: NDArray) -> T.List:
+    if len(corners) == 0:
+        return []
+    rvecs, tvecs = solve_marker_pnp(corners, marker_size, mtx, dist)
+    res = []
+    for i, tvec, rvec in zip(ids, tvecs, rvecs):
+        tvec = tvec.squeeze().tolist()
+        rvec = rvec.squeeze().tolist()
+        rotvector = np.array([[rvec[0], rvec[1], rvec[2]]])
+        Rotation = cv2.Rodrigues(rotvector)[0]
+        Euler = CvtRotationMatrixToEulerAngle(Rotation)
+        cam_coords = tvec + rvec
+        target_coords = cam_coords
+    return target_coords
+
+
+# Convert Euler angles into rotation matrices
+def CvtEulerAngleToRotationMatrix(ptrEulerAngle):
+    ptrSinAngle = np.sin(ptrEulerAngle)
+    ptrCosAngle = np.cos(ptrEulerAngle)
+    ptrRotationMatrix = np.zeros((3, 3))
+    ptrRotationMatrix[0, 0] = ptrCosAngle[2] * ptrCosAngle[1]
+    ptrRotationMatrix[0, 1] = ptrCosAngle[2] * ptrSinAngle[1] * ptrSinAngle[0] - ptrSinAngle[2] * ptrCosAngle[0]
+    ptrRotationMatrix[0, 2] = ptrCosAngle[2] * ptrSinAngle[1] * ptrCosAngle[0] + ptrSinAngle[2] * ptrSinAngle[0]
+    ptrRotationMatrix[1, 0] = ptrSinAngle[2] * ptrCosAngle[1]
+    ptrRotationMatrix[1, 1] = ptrSinAngle[2] * ptrSinAngle[1] * ptrSinAngle[0] + ptrCosAngle[2] * ptrCosAngle[0]
+    ptrRotationMatrix[1, 2] = ptrSinAngle[2] * ptrSinAngle[1] * ptrCosAngle[0] - ptrCosAngle[2] * ptrSinAngle[0]
+    ptrRotationMatrix[2, 0] = -ptrSinAngle[1]
+    ptrRotationMatrix[2, 1] = ptrCosAngle[1] * ptrSinAngle[0]
+    ptrRotationMatrix[2, 2] = ptrCosAngle[1] * ptrCosAngle[0]
+    return ptrRotationMatrix
+
+
+# Coordinate conversion to homogeneous transformation matrix, (x, y, z, rx, ry, rz) units rad
+def Transformation_matrix(coord):
+    position_robot = coord[:3]
+    pose_robot = coord[3:]
+    RBT = CvtEulerAngleToRotationMatrix(pose_robot)
+    PBT = np.array([[position_robot[0]],
+                    [position_robot[1]],
+                    [position_robot[2]]])
+    temp = np.concatenate((RBT, PBT), axis=1)
+    array_1x4 = np.array([[0, 0, 0, 1]])
+    # Concatenate two arrays by row
+    matrix = np.concatenate((temp, array_1x4), axis=0)
+    return matrix
+
+
+def Eyes_in_hand(coord, camera, arm):
+    # Camera coordinates
+    Position_Camera = np.transpose(camera[:3])
+    # Robot arm coordinate matrix
+    Matrix_BT = Transformation_matrix(coord)
+    # Hand eye matrix
+    if arm == "left":
+        Matrix_TC = np.array([[0, -1, 0, Camera_LEN],
+                              [1, 0, 0, -3],
+                              [0, 0, 1, -Tool_LEN],
+                              [0, 0, 0, 1]])
+    else:
+        Matrix_TC = np.array([[0, 1, 0, Camera_LEN],
+                              [-1, 0, 0, 28],
+                              [0, 0, 1, -Tool_LEN],
+                              [0, 0, 0, 1]])
+    # Object coordinates (camera system)
+    Position_Camera = np.append(Position_Camera, 1)
+    Position_B = Matrix_BT @ Matrix_TC @ Position_Camera
+    return Position_B
+
+
+# Waiting for the end of the dual arm operation
+def wait():
+    time.sleep(0.2)
+    while (ml.is_moving() or mr.is_moving()):
+        time.sleep(0.03)
+
+
+# Waiting for the left arm to finish running
+def waitL():
+    time.sleep(0.2)
+    while (ml.is_moving()):
+        time.sleep(0.03)
+
+
+# Waiting for the right arm to finish running
+def waitR():
+    time.sleep(0.2)
+    while (mr.is_moving()):
+        time.sleep(0.03)
+
+
+# Draw a keyboard frame and read the coordinates of each letter
+def draw(frame, arm):
+    global per_right_corners, per_left_corners
+    # Grayscale the image
+    imGray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # Obtain the corner points of the QR code in the image
+    (corners, ids, rejected_corners) = stag.detectMarkers(imGray, 11)
+    # Obtain the displacement and rotation vectors of the QR code relative to the camera through corner points
+    marker_pos_pack = calc_markers_base_position(corners, ids, marker_size, mtx, dist)
+    if arm == "left":
+        # Obtain the current end coordinates of the robotic arm
+        stag_cur_coords = np.array(ml.get_base_coords())
+        stag_cur_bcl = stag_cur_coords.copy()
+        stag_cur_bcl[-3:] *= (np.pi / 180)
+        # Obtain the coordinates of the QR code relative to the base of the robotic arm through the hand eye matrix
+        stag_fact_bcl = Eyes_in_hand(stag_cur_bcl, marker_pos_pack, "left")
+        stag_coord = stag_cur_coords.copy()
+        stag_coord[0] = stag_fact_bcl[0]
+        stag_coord[1] = stag_fact_bcl[1]
+        stag_coord[2] = stag_fact_bcl[2]
+        # Store the three-dimensional coordinates of the QR code
+        keyboard_coords[","] = stag_coord
+    else:
+        # Obtain the current end coordinates of the robotic arm
+        stag_cur_coords = np.array(mr.get_base_coords())
+        stag_cur_bcl = stag_cur_coords.copy()
+        stag_cur_bcl[-3:] *= (np.pi / 180)
+        # Obtain the coordinates of the QR code relative to the base of the robotic arm through the hand eye matrix
+        stag_fact_bcl = Eyes_in_hand(stag_cur_bcl, marker_pos_pack, "right")
+        stag_coord = stag_cur_coords.copy()
+        stag_coord[0] = stag_fact_bcl[0]
+        stag_coord[1] = stag_fact_bcl[1]
+        stag_coord[2] = stag_fact_bcl[2]
+        # Store the three-dimensional coordinates of the QR code
+        keyboard_coords["."] = stag_coord
+    # Obtain the displacement and rotation vectors of the QR code relative to the camera through corner points
+    rvecs, tvecs = solve_marker_pnp(corners, marker_size, mtx, dist)
+    # Draw the coordinate system
+    cv2.drawFrameAxes(frame, mtx, dist, rvecs, tvecs, 50)
+    draw_img = frame
+
+    x1 = corners[0][0][0][0]
+    y1 = corners[0][0][0][1]
+    x2 = corners[0][0][1][0]
+    y2 = corners[0][0][1][1]
+
+    x = x1 - x2
+    y = y1 - y2
+    # Obtain the deflection angle based on the angle of the line connecting two intersection points
+    r = np.arctan(y / x)
+    r = abs(r)
+    # Obtain the distance between two corner points
+    size = abs(x / np.cos(r))
+    # The distance between the x-axis of the two buttons on the left arm camera
+    left_x_dis = size * 1.3
+    # The distance between the y-axis of the two buttons on the left arm camera
+    left_y_dis = size * 1.35
+    # The distance between the x-axis of the two buttons on the right arm camera
+    right_x_dis = size * 1.3
+    # The distance between the y-axis of the two buttons on the right arm camera
+    right_y_dis = size * 1.35
+    # Radius of key box
+    rad = int(size / 2)
+    # The offset distance between the x-axis of the left arm camera and the first letter
+    left_add_x = [size * 1.25]
+    # The offset distance between the y-axis rows of the left arm camera and the first letter
+    left_add_y = [-size * 2, -size * 2.3, -size * 3]
+    # The offset distance between the x-axis of the right arm camera and the first letter
+    right_add_x = [size * 1.3]
+    # The offset distance between the y-axis rows of the right arm camera and the first letter
+    right_add_y = [size * 4.1,  size * 2.1, size * 1]
+    # Get the center point of the keyframe
+    tray_frame = Path(corners[0][0])
+    tray_frame_center_plot = tray_frame.vertices.mean(axis=0)
+
+    # Draw the button box
+    def draw_keyboard(arm):
+        if arm == "left":
+            # The offset distance between the camera x-axis and the first letter
+            add_x = left_add_x
+            # The offset distance between the y-axis rows of the left arm camera and the first letter
+            add_y = left_add_y
+            # Left arm button layout
+            keyboard_txt = left_keyboard_txt
+            # The distance between the x-axis of the two buttons on the left arm camera
+            x_dis = left_x_dis
+            # The distance between the y-axis of the two buttons on the left arm camera
+            y_dis = left_y_dis
+        else:
+            # The offset distance between the camera x-axis and the first letter
+            add_x = right_add_x
+            # The offset distance between each row of the camera y-axis and the first letter
+            add_y = right_add_y
+            # Right arm button layout
+            keyboard_txt = right_keyboard_txt
+            # The distance between the x-axis of the two buttons on the right arm camera
+            x_dis = right_x_dis
+            # The distance between the y-axis of the two buttons on the right arm camera
+            y_dis = right_y_dis
+
+        # Loop drawing the keyboxes for each row and column
+        for j in range(len(keyboard_txt)):
+            for i in range(len(keyboard_txt[j])):
+                # Obtain the corresponding key letters
+                txt = keyboard_txt[j][i]
+                # Obtain the two-dimensional coordinates of the corresponding keys
+                if arm == "left":
+                    x_key = int(tray_frame_center_plot[0] + add_x[0] + x_dis * j)
+                    y_key = int(tray_frame_center_plot[1] + add_y[j] - y_dis * i)
+                else:
+                    x_key = int(tray_frame_center_plot[0] - x_dis * j)
+                    y_key = int(tray_frame_center_plot[1] + add_y[j] + y_dis * i)
+                if y1 < y2:
+                    rr = -r
+                else:
+                    rr = r
+                row = draw_img.shape[0]
+
+                x_key = x_key
+                y_key = row - y_key
+                x_center = tray_frame_center_plot[0]
+                y_center = row - tray_frame_center_plot[1]
+                # Obtain the position of a point in the image after rotating around another point
+                x_end = (x_key - x_center) * np.cos(rr) - (y_key - y_center) * np.sin(rr) + x_center
+                y_end = (x_key - x_center) * np.sin(rr) + (y_key - y_center) * np.cos(rr) + y_center
+                x_end = int(x_end)
+                y_end = int(row - y_end)
+                # Calculate the corner points of this button
+                key_corners = (np.array(
+                    [[(x_end - size / 2, y_end - size / 2),
+                      (x_end + size / 2, y_end - size / 2),
+                      (x_end + size / 2, y_end + size / 2),
+                      (x_end - size / 2, y_end + size / 2)]],
+                    dtype=np.float32,
+                ),)
+                # Obtain the coordinates of the button (camera system)
+                marker_pos_pack = calc_markers_base_position(key_corners, ids, marker_size, mtx, dist)
+                if arm == "left":
+                    # Obtain the current coordinates of the robotic arm
+                    left_cur_coords = np.array(ml.get_base_coords())
+                    left_cur_bcl = left_cur_coords.copy()
+                    left_cur_bcl[-3:] *= (np.pi / 180)
+                    # Convert key coordinates (camera system) to (base coordinate system) through matrix transformation
+                    left_fact_bcl = Eyes_in_hand(left_cur_bcl, marker_pos_pack, "left")
+                    left_end_coord = left_cur_coords.copy()
+                    left_end_coord[0] = left_fact_bcl[0]
+                    left_end_coord[1] = left_fact_bcl[1]
+                    left_end_coord[2] = stag_coord[2]
+                    # Save the button positions in the dictionary for easy access to subsequent clicks
+                    if txt in left_control:
+                        keyboard_coords[txt] = left_end_coord
+                else:
+                    # Obtain the current coordinates of the robotic arm
+                    right_cur_coords = np.array(mr.get_base_coords())
+                    right_cur_bcl = right_cur_coords.copy()
+                    right_cur_bcl[-3:] *= (np.pi / 180)
+                    # Convert key coordinates (camera system) to (base coordinate system) through matrix transformation
+                    right_fact_bcl = Eyes_in_hand(right_cur_bcl, marker_pos_pack, "right")
+                    right_end_coord = right_cur_coords.copy()
+                    right_end_coord[0] = right_fact_bcl[0]
+                    right_end_coord[1] = right_fact_bcl[1]
+                    right_end_coord[2] = stag_coord[2]
+                    # Save the button positions in the dictionary for easy access to subsequent clicks
+                    if txt in right_control:
+                        keyboard_coords[txt] = right_end_coord
+                # Draw the frame of the button
+                cv2.circle(draw_img, (x_end, y_end), rad, (0, 0, 255), 2)
+
+    draw_keyboard(arm)
+    return draw_img
+
+
+# Fine adjustment of left and right walls
+l_x = 3
+l_y = 3
+r_x = - 5
+r_y = -10
+
+
+def keyboard():
+    while True:
+        key_code = cv2.waitKey(1) & 0xFF
+        if key_code != 255:
+            key_code = chr(key_code)
+            if key_code in left_control:
+                # Read the three-dimensional coordinates of the corresponding keys
+                coords = keyboard_coords[key_code].copy()
+                coords[0] = coords[0] + l_x
+                coords[1] = coords[1] + l_y
+                coords[2] = 315
+                # Control point press button
+                ml.send_base_coords(coords, sp)
+                waitL()
+                ml.send_base_coord(3, 305, sp)
+                waitL()
+                ml.send_base_coords(coords, sp)
+                waitL()
+                ml.send_angles(ml_pos, sp)
+                waitL()
+                print(coords)
+            elif key_code in right_control:
+                # Read the three-dimensional coordinates of the corresponding keys
+                coords = keyboard_coords[key_code].copy()
+                coords[0] = coords[0] + r_x
+                coords[1] = coords[1] + r_y
+                coords[2] = 330
+                # Control point press button
+                mr.send_base_coords(coords, sp)
+                waitR()
+                mr.send_base_coord(3, 320, sp)
+                waitR()
+                mr.send_base_coords(coords, sp)
+                waitR()
+                mr.send_angles(mr_pos, sp)
+                waitR()
+                print(coords)
+            print("===============================================")
+
+
+def write_string(txt):
+    per_key = None
+    # Loop click button
+    for key_code in txt:
+        cv2.waitKey(1)
+        if key_code in left_control:
+            # Read which arm the previous button was on. If it is the same arm, click continuously. If not, the other arm will return to the initial point
+            if per_key not in left_control:
+                # Return to the starting point
+                mr.send_angles(mr_pos, sp)
+                waitR()
+            per_key = key_code
+            # Read the three-dimensional coordinates of the corresponding keys
+            coords = keyboard_coords[key_code].copy()
+            coords[0] = coords[0] + l_x
+            coords[1] = coords[1] + l_y
+            coords[2] = 315
+            # Control the mechanical arm by clicking and pressing
+            ml.send_base_coords(coords, sp)
+            waitL()
+            ml.send_base_coord(3, 305, sp)
+            waitL()
+            ml.send_base_coords(coords, sp)
+            waitL()
+            print(coords)
+        elif key_code in right_control:
+            # Read which arm the previous button was on. If it is the same arm, click continuously. If not, the other arm will return to the initial point
+            if per_key not in right_control:
+                # Return to the starting point
+                ml.send_angles(ml_pos, sp)
+                waitL()
+            per_key = key_code
+            # Read the three-dimensional coordinates of the corresponding keys
+            coords = keyboard_coords[key_code].copy()
+            coords[0] = coords[0] + r_x
+            coords[1] = coords[1] + r_y
+            coords[2] = 330
+            # Control the mechanical arm by clicking and pressing
+            mr.send_base_coords(coords, sp)
+            waitR()
+            mr.send_base_coord(3, 320, sp)
+            waitR()
+            mr.send_base_coords(coords, sp)
+            waitR()
+            print(coords)
+        print("===============================================")
+
+
+# Open the camera to read the image
+def camera():
+    per_frame_left = None
+    per_frame_right = None
+    while True:
+        left_camera.update_frame()
+        left_frame = left_camera.color_frame()
+        try:
+            left_frame = draw(left_frame, "left")
+            per_frame_left = left_frame
+        except Exception as e:
+            pass
+        right_camera.update_frame()
+        right_frame = right_camera.color_frame()
+        try:
+            right_frame = draw(right_frame, "right")
+            per_frame_right = right_frame
+        except Exception as e:
+            pass
+        # rotate image
+        left_turn_img = cv2.rotate(left_frame, cv2.ROTATE_90_CLOCKWISE)
+        right_turn_img = cv2.rotate(right_frame, cv2.ROTATE_90_CLOCKWISE)
+        # merge images
+        imgs = np.hstack([left_turn_img, right_turn_img])
+        # Show pictures
+        cv2.imshow("calibed", imgs)
+        key_code = cv2.waitKey(1) & 0xFF
+        # When pressing the q key, capture a picture for operation
+        if chr(key_code) == "q":
+            left_turn_img = cv2.rotate(per_frame_left, cv2.ROTATE_90_CLOCKWISE)
+            right_turn_img = cv2.rotate(per_frame_right, cv2.ROTATE_90_CLOCKWISE)
+            imgs = np.hstack([left_turn_img, right_turn_img])
+            cv2.imshow("calibed", imgs)
+            break
+    # Control both arms and click on the keyboard to hello world
+    write_string("helloworld")
+
+
+if __name__ == "__main__":
+    # Set left and right wall ports
+    mr = Mercury("/dev/ttyACM0")
+    ml = Mercury("/dev/ttyTHS0")
+    # Store the corner values of the QR code read by the left and right arms
+    per_left_corners = []
+    per_right_corners = []
+    Sp=60 # Robot arm movement speed
+    Tool_LEN=175 # Distance between Claw and Flange
+    CameraLEN=78 # Distance between camera and flange
+    # Set the initial angle of the left and right arms
+    ml_pos = [-31.92, -7.36, 0.0, -110.82, 81.75, 59.04, 44.25]
+    mr_pos = [27.12, 28.34, 0.0, -108.77, -69.42, 71.92, -9.52]
+    # Left arm keyboard layout
+    left_keyboard_txt = [
+        ["q", "w", "e", "r", "t", "y", "u", "i", "o", "p"],
+        ["a", "s", "d", "f", "g", "h", "j", "k", "l"],
+        ["z", "x", "c", "v", "b", "n", "m"]
+    ]
+    # Right arm keyboard layout
+    right_keyboard_txt = [
+        ["m", "n", "b", "v", "c", "x", "z"],
+        ["l", "k", "j", "h", "g", "f", "d", "s", "a"],
+        ["p", "o", "i", "u", "y", "t", "r", "e", "w", "q"],
+    ]
+    # Left arm clicks on letters
+    left_control = ["q", "w", "e", "r", "t",
+                    "a", "s", "d", "f", "g",
+                    "z", "x", "c", "v", ","]
+    # Right arm clicks on letters
+    right_control = ["y", "u", "i", "o", "p",
+                     "h", "j", "k", "l",
+                     "b", "n", "m", "."]
+    # Store the three-dimensional coordinates of all keyboard keys
+    keyboard_coords = {}
+
+    np.set_printoptions(suppress=True, formatter={'float_kind': '{:.2f}'.format})
+    # Camera configuration file
+    camera_params = np.load("src/camera_params.npz")
+    mtx, dist = camera_params["mtx"], camera_params["dist"]
+    # QR code size
+    marker_size = 15
+    # Set left and right arm camera IDs
+    left_camera = UVCCamera(3, mtx, dist)
+    left_camera.capture()
+    right_camera = UVCCamera(2, mtx, dist)
+    right_camera.capture()
+    # Move the left and right walls to the initial point
+    mr.send_angles(mr_pos, sp)
+    ml.send_angles(ml_pos, sp)
+    # Waiting for the end of the exercise
+    wait()
+    time.sleep(2)
+    camera()
+    # threading.Thread(target=camera).start()
+    # while True:
+    #     s = input("键盘字母：")
+    #     if s in left_control:
+    #         coords = keyboard_coords[s]
+    #         print(coords)
+    #
+    #     elif s in right_control:
+    #         coords = keyboard_coords[s]
+    #         print(coords)
+
